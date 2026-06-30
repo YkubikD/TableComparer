@@ -1,381 +1,391 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
+using System.Net.Http;
 using System.Text;
-using System.Windows.Forms;
 using ExcelDataReader;
 
 namespace TableComparer
 {
-    internal class Program
+    public class ProductItem
     {
-        // Хранилище данных для позиций из ТТН
-        public class TtnProduct
-        {
-            public string FullName { get; set; }
-            public int Quantity { get; set; }
-            public decimal TotalSumWithoutNds { get; set; }
-            public bool IsMatched { get; set; }
-        }
+        public string OrderRow { get; set; } = "";
+        public string TtnRow { get; set; } = "";
+        public string Article { get; set; } = "";
+        public string FullName { get; set; } = "";
+        public int Quantity { get; set; }
+        public decimal Price { get; set; }
+        public decimal TotalSum { get; set; }
+        public bool IsMatched { get; set; } = false;
+    }
 
-        // Хранилище данных для позиций из Заказа
-        public class OrderProduct
-        {
-            public string CustomerName { get; set; } // Наименование заказчика (столбцы 27-59)
-            public string Article { get; set; }       // Артикул или код сайта (столбцы 70-77)
-            public int Quantity { get; set; }
-            public decimal TotalSumWithoutNds { get; set; }
-            public bool IsMatched { get; set; }
-        }
+    class Program
+    {
+        // Облачный словарь: Ключ = Код 1С (Заказ), Значение = Текст для поиска (ТТН)
+        static Dictionary<string, string> GoogleCloudDictionary = new Dictionary<string, string>();
 
         [STAThread]
         static void Main(string[] args)
         {
-            // Включаем поддержку кодировок для ExcelDataReader
             Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+            Console.Title = "Сверка ТТН и Заказа (Облачная база)";
+            Console.WriteLine("=== ЗАПУСК ПРОГРАММЫ СВЕРКИ ===");
 
-            Console.WriteLine("=== ПРОГРАММА СВЕРКИ: ТТН VS ЗАКАЗ ===");
+            // Ваша новая прямая ссылка на опубликованный Лист 4 в формате CSV
+            string googleUrl = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSKW70yWRuYKcwWBXWR38adHM5FtAgZC7VWx08-kGDZb46lgNXMUCsLhrGZroA8pV3Beseo0DukwgQ6/pub?gid=1609197053&single=true&output=csv";
 
-            OpenFileDialog openFileDialog1 = new OpenFileDialog();
-            OpenFileDialog openFileDialog2 = new OpenFileDialog();
+            Console.WriteLine("\n[1/3] Загрузка облачной базы артикулов...");
+            if (!LoadGoogleSpreadsheet(googleUrl))
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("Критическая ошибка: База не загружена. Работа остановлена.");
+                Console.ResetColor();
+                Console.ReadLine();
+                return;
+            }
 
-            openFileDialog1.Title = "Выберите файл ТТН (Накладной)";
-            openFileDialog2.Title = "Выберите файл ЗАКАЗА (21vek)";
-            openFileDialog1.Filter = "Excel Files|*.xlsx;*.xls";
-            openFileDialog2.Filter = "Excel Files|*.xlsx;*.xls";
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine("\nВыберите файл Накладной (ТТН)...");
+            Console.ResetColor();
+            string pathFile1 = SelectExcelFile();
+            if (string.IsNullOrEmpty(pathFile1)) return;
 
-            string ttnPath = ""; string orderPath = "";
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine("Выберите файл Заказа от покупателя...");
+            Console.ResetColor();
+            string pathFile2 = SelectExcelFile();
+            if (string.IsNullOrEmpty(pathFile2)) return;
 
-            if (openFileDialog1.ShowDialog() == DialogResult.OK) ttnPath = openFileDialog1.FileName; else return;
-            if (openFileDialog2.ShowDialog() == DialogResult.OK) orderPath = openFileDialog2.FileName; else return;
+            Console.WriteLine("\n[2/3] Считывание файлов Excel...");
+            List<ProductItem> ttnList = ReadTtnDocument(pathFile1, startRow: 40, nameIdx: 0, qtyIdx: 17, priceIdx: 20);
+            List<ProductItem> orderList = ReadOrderDocument(pathFile2, startRow: 25, artIdx: 69, nameIdx: 26, qtyIdx: 101, priceIdx: 119);
 
-            Console.Clear();
-            Console.WriteLine("Выполняется чтение документов, подождите...");
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"Успешно: ТТН = {ttnList.Count} поз. | Заказ = {orderList.Count} поз.");
+            Console.ResetColor();
 
-            // Считывание данных из файлов через подпрограммы
-            var ttnList = ReadTtnDocument(ttnPath, startRow: 40);
-            var orderList = ReadOrderDocument(orderPath, startRow: 25);
+            Console.WriteLine("[3/3] Выполнение автоматической сверки...");
+            List<string> reportLines = ExecuteComparison(ttnList, orderList);
 
-            Console.Clear();
-            Console.WriteLine($"=== РЕЗУЛЬТАТЫ СВЕРКИ (ТТН: {ttnList.Count} поз., Заказ: {orderList.Count} поз.) ===\n");
+            Console.WriteLine("\n=== РЕЗУЛЬТАТЫ СВЕРКИ ===");
+            foreach (var line in reportLines)
+            {
+                if (line.StartsWith("[OK]")) Console.ForegroundColor = ConsoleColor.Green;
+                else if (line.StartsWith("[-]")) Console.ForegroundColor = ConsoleColor.Red;
+                else if (line.StartsWith("[!]")) Console.ForegroundColor = ConsoleColor.Yellow;
+                else if (line.StartsWith("[+]")) Console.ForegroundColor = ConsoleColor.Magenta;
 
-            StringBuilder logReport = new StringBuilder();
+                Console.WriteLine(line);
+                Console.ResetColor();
+            }
+            Console.WriteLine("=========================\n");
+
+            Console.ForegroundColor = ConsoleColor.DarkYellow;
+            Console.WriteLine("Готово. Нажмите Enter для выхода...");
+            Console.ReadLine();
+        }
+
+        static bool LoadGoogleSpreadsheet(string url)
+        {
+            try
+            {
+                using (HttpClient client = new HttpClient())
+                {
+                    // Скачиваем CSV поток данных
+                    var stream = client.GetStreamAsync(url).Result;
+
+                    // Используем встроенный неубиваемый TextFieldParser для разбора CSV с кавычками
+                    using (var parser = new Microsoft.VisualBasic.FileIO.TextFieldParser(stream, Encoding.UTF8))
+                    {
+                        parser.TextFieldType = Microsoft.VisualBasic.FileIO.FieldType.Delimited;
+                        parser.SetDelimiters(",");
+                        parser.HasFieldsEnclosedInQuotes = true; // Защита от запятых внутри названий моек
+
+                        bool isHeader = true;
+
+                        while (!parser.EndOfData)
+                        {
+                            string[] parts = parser.ReadFields();
+                            if (isHeader) { isHeader = false; continue; } // Пропускаем шапку
+
+                            if (parts == null || parts.Length < 2) continue;
+
+                            string fullName = parts[0]?.Trim() ?? ""; // Колонка A
+                            string article = parts[1]?.Trim() ?? "";  // Колонка B
+
+                            // СТОП-МАРКЕР: Если артикул пустой — таблица гарантированно закончилась
+                            if (string.IsNullOrEmpty(article) || article.ToLower().Contains("штамп"))
+                                break;
+
+                            // Если артикул есть, но имя пустое — подставляем артикул, чтобы не упасть
+                            if (string.IsNullOrEmpty(fullName))
+                            {
+                                fullName = "Модель без имени (" + article + ")";
+                            }
+
+                            // Пропускаем служебные заголовки
+                            if (article.ToLower().Contains("артикул"))
+                                continue;
+
+                            // Создаем чистый ключ без пробелов и дефисов
+                            string cleanArtKey = article.Replace(" ", "").Replace("-", "").ToUpper();
+
+                            if (!GoogleCloudDictionary.ContainsKey(cleanArtKey))
+                            {
+                                GoogleCloudDictionary.Add(cleanArtKey, fullName);
+                            }
+                        }
+                    }
+                }
+
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"Успешно. Облачная база загружена: {DateTime.Now:dd.MM.yyyy HH:mm}");
+                Console.WriteLine($"Активных позиций в памяти: {GoogleCloudDictionary.Count} шт.");
+                Console.ResetColor();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"Ошибка сети или парсера при загрузке базы: {ex.Message}");
+                Console.ResetColor();
+                return false;
+            }
+        }
+
+        static string SelectExcelFile()
+        {
+            using (var ofd = new System.Windows.Forms.OpenFileDialog())
+            {
+                ofd.Filter = "Файлы Excel (*.xlsx;*.xls)|*.xlsx;*.xls";
+                ofd.Title = "Выберите документ";
+                if (ofd.ShowDialog() == System.Windows.Forms.DialogResult.OK)
+                {
+                    Console.WriteLine($"Выбран: {Path.GetFileName(ofd.FileName)}");
+                    return ofd.FileName;
+                }
+            }
+            return null;
+        }
+
+
+
+
+        //конец части 1
+
+
+
+
+        // Основной метод сверки
+        static List<string> ExecuteComparison(List<ProductItem> ttnList, List<ProductItem> orderList)
+        {
+            List<string> report = new List<string>();
             bool hasDiscrepancies = false;
 
-            // Расширенный массив корней цветов Polygran (Добавлены: КРЕМ, ОПАЛ, ХЛОПОК)
-            string[] colors = { "ПЕСОЧН", "СЕР", "ЧЕРН", "БЕЛ", "БЕЖ", "ГРАФИТ", "АНТРАЦИТ", "КОСМОС", "КРЕМ", "ОПАЛ", "ХЛОПОК" };
-
-            // =================================================================================
-            // // ЦИКЛ 1: Главный цикл сверки (идёт по всем товарам из файла ЗАКАЗА)
-            // =================================================================================
-            foreach (var ord in orderList)
+            // Проходим по каждой позиции Заказа от "21 века"
+            foreach (var orderItem in orderList)
             {
-                TtnProduct ttnMatch = null;
-                bool isDigitalCode = long.TryParse(ord.Article, out _);
+                // Очищаем артикул из заказа для поиска в облачном словаре
+                string cleanOrderArt = orderItem.Article.Replace(" ", "").Replace("-", "").ToUpper();
 
-                if (isDigitalCode)
+                // Проверяем, внесли ли вы этот артикул в Гугл-таблицу (Лист 4)
+                if (!GoogleCloudDictionary.ContainsKey(cleanOrderArt))
                 {
-                    // === ПЛАН А (Для вытяжек и кодов 1С): Прямой поиск точного числового кода в названии ТТН ===
-                    ttnMatch = ttnList.Find(t => !t.IsMatched && t.FullName.ToUpper().Contains(ord.Article.ToUpper()));
-                }
-                else
-                {
-                    // === ПЛАН А (Для моек): Глубокая очистка текстового артикула из Заказа ===
-                    string cleanOrderArticle = ord.Article.ToUpper()
-                        .Replace(" ", "").Replace("-", "").Replace("RUS", "")
-                        .Replace("ЧЕРНЫЙ", "").Replace("ПЕСОЧНЫЙ", "").Replace("СЕРЫЙ", "")
-                        .Replace("БЕЛЫЙ", "").Replace("БЕЖЕВЫЙ", "").Replace("КОСМОС", "")
-                        .Replace("GF", "").Replace("QUARZ", "").Trim();
-
-                    // Извлекаем маркеры сторон чаши L и R для Заказа
-                    string orderSide = "БЕЗ_МАРКИРОВКИ";
-                    if (cleanOrderArticle.EndsWith("L")) { orderSide = "ЛЕВАЯ"; cleanOrderArticle = cleanOrderArticle.Substring(0, cleanOrderArticle.Length - 1); }
-                    else if (cleanOrderArticle.EndsWith("R")) { orderSide = "ПРАВАЯ"; cleanOrderArticle = cleanOrderArticle.Substring(0, cleanOrderArticle.Length - 1); }
-
-                    cleanOrderArticle = cleanOrderArticle.Replace("M", "М");
-
-                    if (cleanOrderArticle.Length >= 2)
-                    {
-                        ttnMatch = ttnList.Find(t => {
-                            if (t.IsMatched) return false;
-                            string cleanTtnName = t.FullName.ToUpper().Replace(" ", "").Replace("-", "").Replace("M", "М").Replace("GF", "").Replace("QUARZ", "");
-                            if (!cleanTtnName.Contains(cleanOrderArticle)) return false;
-
-                            // Контроль стороны чаши в ТТН
-                            string ttnSide = "БЕЗ_МАРКИРОВКИ";
-                            if (cleanTtnName.Contains("ЛЕВ") || cleanTtnName.Contains("СЛЕВА")) ttnSide = "ЛЕВАЯ";
-                            if (cleanTtnName.Contains("ПРАВ") || cleanTtnName.Contains("СПРАВА")) ttnSide = "ПРАВАЯ";
-
-                            return orderSide == ttnSide;
-                        });
-                    }
+                    hasDiscrepancies = true;
+                    report.Add($"[!] ПРЕДУПРЕЖДЕНИЕ: Артикул [{orderItem.Article}] ({orderItem.FullName}) ОТСУТСТВУЕТ в Гугл-таблице! Внесите его в базу.");
+                    continue;
                 }
 
-                // === ПЛАН Б (РЕЗЕРВНЫЙ ПО ЦВЕТУ И МОДЕЛИ): Если План А не сработал (для Polygran и Granfest) ===
-                if (ttnMatch == null)
+                // Достаем из облачной базы полное текстовое наименование
+                string cloudTtnNameTarget = GoogleCloudDictionary[cleanOrderArt].ToUpper().Replace(" ", "").Replace("-", "");
+
+                // Выделяем базовое имя модели для сопоставления (например, ARGO420, BLADE500, S416)
+                string modelKey = "";
+                if (cloudTtnNameTarget.Contains("ARGO")) modelKey = "ARGO";
+                else if (cloudTtnNameTarget.Contains("BLADE")) modelKey = "BLADE";
+                else if (cloudTtnNameTarget.Contains("TOLERO")) modelKey = "TOLERO";
+                else if (cloudTtnNameTarget.Contains("BRIG")) modelKey = "BRIG";
+                else if (cloudTtnNameTarget.Contains("GALS")) modelKey = "GALS";
+                else if (cloudTtnNameTarget.Contains("SMART")) modelKey = "SMART";
+                else if (cloudTtnNameTarget.Contains("URBAN")) modelKey = "URBAN";
+                else if (cloudTtnNameTarget.Contains("CORNER")) modelKey = "CORNER";
+                else if (cloudTtnNameTarget.Contains("RONDO")) modelKey = "RONDO";
+                else if (cloudTtnNameTarget.Contains("UNIQUE")) modelKey = "UNIQUE";
+                else if (cloudTtnNameTarget.Contains("QUADRO")) modelKey = "QUADRO";
+
+                // Если в облачном наименовании есть специфичный цифровой индекс модели (например, 420, 460, 445)
+                string digits = new string(cloudTtnNameTarget.Where(char.IsDigit).ToArray());
+
+                // Ищем подходящий товар в ТТН отгрузки склада среди еще не сопоставленных
+                var matchedTtn = ttnList.Find(t => !t.IsMatched && (
+                    // Вариант 1: Полное совпадение очищенного текста из облака с текстом ТТН
+                    t.FullName.ToUpper().Replace(" ", "").Replace("-", "").Contains(cloudTtnNameTarget) ||
+                    // Вариант 2: Защитный поиск по бренду, цифрам серии и стороне чаши
+                    (!string.IsNullOrEmpty(modelKey) &&
+                     t.FullName.ToUpper().Replace(" ", "").Replace("-", "").Contains(modelKey) &&
+                     (!string.IsNullOrEmpty(digits) && t.FullName.Contains(digits)) &&
+                     MatchSides(t.FullName, orderItem.FullName))
+                ));
+
+                if (matchedTtn != null)
                 {
-                    string nameUpper = ord.CustomerName.ToUpper();
-                    string extractedModel = "";
+                    matchedTtn.IsMatched = true;
+                    orderItem.IsMatched = true;
 
-                    // Добавили новые модели моек со скриншота: ARGO 460, 560, 760
-                    if (nameUpper.Contains("BLADE 500")) extractedModel = "BLADE500";
-                    else if (nameUpper.Contains("TOLERO 580")) extractedModel = "TOLERO580";
-                    else if (nameUpper.Contains("ARGO 460")) extractedModel = "ARGO460";
-                    else if (nameUpper.Contains("ARGO 560")) extractedModel = "ARGO560";
-                    else if (nameUpper.Contains("ARGO 760")) extractedModel = "ARGO760";
-                    else if (nameUpper.Contains("GALS 862")) extractedModel = "GALS862";
-                    else if (nameUpper.Contains("BRIG 772") || nameUpper.Contains("BRIG-772")) extractedModel = "BRIG772";
-                    else if (nameUpper.Contains("QUARZ 18") || nameUpper.Contains("Z18") || nameUpper.Contains("Z-18")) extractedModel = "QUARZ18";
-                    else if (nameUpper.Contains("РОТОНДА")) extractedModel = "РОТОНДА";
-                    else if (nameUpper.Contains("ПЕРГОЛА")) extractedModel = "ПЕРГОЛА";
-                    else if (nameUpper.Contains("SLIDE")) extractedModel = "SLIDE";
-                    else
-                    {
-                        int polyIdx = nameUpper.IndexOf("POLYGRAN");
-                        if (polyIdx != -1 && polyIdx + 9 < nameUpper.Length)
-                        {
-                            string sub = nameUpper.Substring(polyIdx + 9).Trim();
-                            string[] words = sub.Split(' ');
-                            if (words.Length >= 2) extractedModel = words[0] + words[1];
-                        }
-                    }
-                    extractedModel = extractedModel.Replace(" ", "").Replace("-", "");
-
-                    string detectedColor = "";
-                    foreach (var c in colors) { if (nameUpper.Contains(c)) { detectedColor = c; break; } }
-
-                    if (!string.IsNullOrEmpty(extractedModel))
-                    {
-                        ttnMatch = ttnList.Find(t => {
-                            if (t.IsMatched) return false;
-
-                            // Очитка названия ТТН от знаков № и лишних символов
-                            string cleanTtn = t.FullName.ToUpper().Replace(" ", "").Replace("-", "").Replace("№", "");
-
-                            bool modelOk = cleanTtn.Contains(extractedModel) || (extractedModel == "QUARZ18" && cleanTtn.Contains("Z18"));
-                            bool colorOk = string.IsNullOrEmpty(detectedColor) || cleanTtn.Contains(detectedColor);
-                            return modelOk && colorOk;
-                        });
-                    }
-                }
-
-                // === СВЕРКА МАТЕМАТИКИ И ВЫВОД РАСХОЖДЕНИЙ ===
-                if (ttnMatch != null)
-                {
-                    ord.IsMatched = true; ttnMatch.IsMatched = true;
-                    bool qtyMismatch = ord.Quantity != ttnMatch.Quantity;
-                    bool sumMismatch = Math.Round(ord.TotalSumWithoutNds, 2) != Math.Round(ttnMatch.TotalSumWithoutNds, 2);
-
-                    if (qtyMismatch || sumMismatch)
+                    // Проверяем расхождения по количеству или по цене отгрузки
+                    if (matchedTtn.Quantity != orderItem.Quantity || Math.Abs(matchedTtn.Price - orderItem.Price) > 0.05m)
                     {
                         hasDiscrepancies = true;
-                        string err = $"[!] Расхождение по товару (Идентификатор: {ord.Article})\n" +
-                                     $"    Имя в Заказе: {ord.CustomerName}\n" +
-                                     $"    Имя в ТТН:    {ttnMatch.FullName}\n";
-                        if (qtyMismatch) err += $"    [-] КОЛИЧЕСТВО: Заказ = {ord.Quantity} шт. | ТТН = {ttnMatch.Quantity} шт. (Разница: {ord.Quantity - ttnMatch.Quantity})\n";
-                        if (sumMismatch) err += $"    [-] СУММА БЕЗ НДС: Заказ = {ord.TotalSumWithoutNds:F2} руб. | ТТН = {ttnMatch.TotalSumWithoutNds:F2} руб.\n";
+                        string diff = $"[!] Расхождение по товару (Код 1С: {orderItem.Article}):\n" +
+                                      $"    Заказ (21 век): {orderItem.FullName}\n" +
+                                      $"    ТТН (Отгрузка): {matchedTtn.FullName}\n";
 
-                        Console.ForegroundColor = ConsoleColor.Yellow; Console.WriteLine(err.TrimEnd()); Console.ResetColor();
-                        Console.WriteLine(new string('-', 70)); logReport.AppendLine(err + new string('-', 50) + "\n");
+                        if (matchedTtn.Quantity != orderItem.Quantity)
+                            diff += $"    [-] КОЛИЧЕСТВО: Заказ = {orderItem.Quantity} шт. | ТТН = {matchedTtn.Quantity} шт. (Разница: {orderItem.Quantity - matchedTtn.Quantity})\n";
+
+                        if (Math.Abs(matchedTtn.Price - orderItem.Price) > 0.05m)
+                            diff += $"    [-] ЦЕНА: Заказ = {orderItem.Price} руб. | ТТН = {matchedTtn.Price} руб.\n";
+
+                        report.Add(diff);
                     }
                 }
                 else
                 {
                     hasDiscrepancies = true;
-                    string err = $"[-] Товар из Заказа [{ord.Article}] ({ord.CustomerName}) ОТСУТСТВУЕТ в ТТН!\n";
-                    Console.ForegroundColor = ConsoleColor.Red; Console.WriteLine(err.TrimEnd()); Console.ResetColor();
-                    Console.WriteLine(new string('-', 70)); logReport.AppendLine(err + new string('-', 50) + "\n");
+                    report.Add($"[-] Товар из Заказа [{orderItem.Article}] ({orderItem.FullName}) НЕ НАЙДЕН в ТТН отгрузки!");
                 }
             }
-            // =================================================================================
-            // КОНЕЦ // ЦИКЛ 1
-            // =================================================================================
 
-            // =================================================================================
-            // // ЦИКЛ 2: Проверка лишних позиций в ТТН (ищет товары, к которым не подошел заказ)
-            // =================================================================================
-            foreach (var ttn in ttnList)
+            // Ищем позиции, которые склад отгрузил по ТТН, но "21 век" их не заказывал
+            foreach (var ttnItem in ttnList.Where(t => !t.IsMatched))
             {
-                if (!ttn.IsMatched)
-                {
-                    hasDiscrepancies = true;
-                    string err = $"[+] Позиция из ТТН [{ttn.FullName}] отсутствует в Заказе (лишний товар или не распознан)!\n";
-                    Console.ForegroundColor = ConsoleColor.Cyan; Console.WriteLine(err.TrimEnd()); Console.ResetColor();
-                    Console.WriteLine(new string('-', 70)); logReport.AppendLine(err + new string('-', 50) + "\n");
-                }
-            }
-            // =================================================================================
-            // КОНЕЦ // ЦИКЛ 2
-            // =================================================================================
-
-            if (!hasDiscrepancies)
-            {
-                Console.ForegroundColor = ConsoleColor.Green; Console.WriteLine("✔ Сверка успешно завершена! Расхождений не обнаружено."); Console.ResetColor();
-            }
-            else
-            {
-                try
-                {
-                    string desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
-                    File.WriteAllText(Path.Combine(desktopPath, "Результат_Сверки.txt"), logReport.ToString(), Encoding.UTF8);
-                    Console.ForegroundColor = ConsoleColor.Blue; Console.WriteLine("\n[!] Подробный лог сохранен на Рабочий стол: 'Результат_Сверки.txt'"); Console.ResetColor();
-                }
-                catch { }
+                hasDiscrepancies = true;
+                report.Add($"[+] Лишний товар в ТТН! Позиция [{ttnItem.FullName}] отсутствует в Заказе клиента.");
             }
 
-            Console.WriteLine("\nНажмите Enter для завершения работы...");
-            Console.ReadLine();
-        } // Конец метода Main
+            if (!hasDiscrepancies) report.Add("[OK] Склад полностью и правильно отгрузил Заказ. Позиции, количества и цены совпали идеально.");
+            return report;
+        }
 
-        /// <summary>
-        /// Чтение ТТН: старт с 40 строки, лимит по «ИТОГО»
-        /// </summary>
-        static List<TtnProduct> ReadTtnDocument(string filePath, int startRow)
+        // Вспомогательный метод проверки направления чаши (ЛЕВ/ПРАВ/L/R)
+        static bool MatchSides(string ttnName, string orderName)
         {
-            var list = new List<TtnProduct>();
+            string t = ttnName.ToUpper();
+            string o = orderName.ToUpper();
 
-            using (var stream = File.Open(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-            using (var reader = ExcelReaderFactory.CreateReader(stream))
+            bool ttnSide = t.Contains("ЛЕВ") || t.Contains("L") || t.Contains("СЛЕВА") || t.Contains("ЛЕВАЯ");
+            bool ordSide = o.Contains("ЛЕВ") || o.Contains("L") || o.Contains("СЛЕВА") || o.Contains("ЛЕВАЯ");
+
+            return ttnSide == ordSide;
+        }
+
+
+
+
+
+        //конец части 2
+
+
+
+
+        // Метод для чтения Накладной (ТТН)
+        static List<ProductItem> ReadTtnDocument(string filePath, int startRow, int nameIdx, int qtyIdx, int priceIdx)
+        {
+            var result = new List<ProductItem>();
+            using (var stream = File.Open(filePath, FileMode.Open, FileAccess.Read))
             {
-                int currentRow = 0;
-
-                // =============================================================================
-                // // ЦИКЛ 3: Построчное чтение и разбор файла НАКЛАДНОЙ (ТТН)
-                // =============================================================================
-                while (reader.Read())
+                using (var reader = ExcelReaderFactory.CreateReader(stream))
                 {
-                    currentRow++;
-                    if (currentRow < startRow) continue;
-                    if (reader.FieldCount < 25) continue; // Защита от коротких сервисных строк
-
-                    // Наименование товара (Столбцы 1-14, индексы в C# 0-13)
-                    string rawName = "";
-                    for (int i = 0; i <= 13; i++)
+                    int currentRow = 0;
+                    while (reader.Read())
                     {
-                        var val = reader.GetValue(i);
-                        if (val != null && !string.IsNullOrEmpty(val.ToString()))
-                        {
-                            rawName = val.ToString().Trim();
+                        currentRow++;
+                        if (currentRow < startRow) continue;
+
+                        object nameObj = reader.GetValue(nameIdx);
+                        if (nameObj == null) continue;
+
+                        string rawName = nameObj.ToString();
+
+                        // Прерываем чтение при обнаружении итоговых строк
+                        if (rawName.ToUpper().Contains("ВСЕГО") || rawName.ToUpper().Contains("ИТОГО"))
                             break;
-                        }
-                    }
 
-                    // Жесткое ограничение ТТН: Стоп на итоговых строках
-                    if (string.IsNullOrEmpty(rawName) ||
-                        rawName.StartsWith("ИТОГО", StringComparison.OrdinalIgnoreCase) ||
-                        rawName.StartsWith("Всего", StringComparison.OrdinalIgnoreCase) ||
-                        rawName.Contains("Отпуск разрешил") ||
-                        rawName.Contains("Сдал грузоотправитель"))
-                    {
-                        if (rawName.StartsWith("ИТОГО", StringComparison.OrdinalIgnoreCase) || rawName.StartsWith("Всего", StringComparison.OrdinalIgnoreCase))
-                            break; // Полностью выходим из цикла чтения ТТН
-                        continue;
-                    }
+                        int qty = 0;
+                        object qtyObj = reader.GetValue(qtyIdx);
+                        if (qtyObj != null) int.TryParse(qtyObj.ToString(), out qty);
 
-                    // Количество (Столбцы 18-20, индексы в C# 17-19)
-                    int qty = 0;
-                    for (int i = 17; i <= 19; i++)
-                    {
-                        var val = reader.GetValue(i);
-                        if (val != null)
+                        decimal price = 0;
+                        object priceObj = reader.GetValue(priceIdx);
+                        if (priceObj != null) decimal.TryParse(priceObj.ToString(), out price);
+
+                        if (qty > 0)
                         {
-                            int.TryParse(val.ToString(), out qty);
-                            if (qty > 0) break;
+                            result.Add(new ProductItem
+                            {
+                                FullName = rawName,
+                                Quantity = qty,
+                                Price = price,
+                                TtnRow = currentRow.ToString()
+                            });
                         }
-                    }
-
-                    // Цена за 1 шт (Столбцы 21-24, индексы в C# 20-23)
-                    decimal price = 0;
-                    for (int i = 20; i <= 23; i++)
-                    {
-                        var val = reader.GetValue(i);
-                        if (val != null)
-                        {
-                            decimal.TryParse(val.ToString(), out price);
-                            if (price > 0) break;
-                        }
-                    }
-
-                    if (qty > 0)
-                    {
-                        list.Add(new TtnProduct
-                        {
-                            FullName = rawName.Replace("\n", " ").Replace("\r", ""),
-                            Quantity = qty,
-                            TotalSumWithoutNds = qty * price // Вычисляем стоимость всей строки без НДС
-                        });
                     }
                 }
-                // =============================================================================
-                // КОНЕЦ // ЦИКЛ 3
-                // =============================================================================
             }
-            return list;
+            return result;
         }
 
-        /// <summary>
-        /// Чтение Заказа: старт с 25 строки, лимит по пустой строке артикула
-        /// </summary>
-        static List<OrderProduct> ReadOrderDocument(string filePath, int startRow)
+        // Метод для чтения файла Заказа
+        static List<ProductItem> ReadOrderDocument(string filePath, int startRow, int artIdx, int nameIdx, int qtyIdx, int priceIdx)
         {
-            var list = new List<OrderProduct>();
-
-            using (var stream = File.Open(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-            using (var reader = ExcelReaderFactory.CreateReader(stream))
+            var result = new List<ProductItem>();
+            using (var stream = File.Open(filePath, FileMode.Open, FileAccess.Read))
             {
-                int currentRow = 0;
-
-                // =============================================================================
-                // // ЦИКЛ 4: Построчное чтение и разбор файла ЗАКАЗА ПОСТАВЩИКУ
-                // =============================================================================
-                while (reader.Read())
+                using (var reader = ExcelReaderFactory.CreateReader(stream))
                 {
-                    currentRow++;
-                    if (currentRow < startRow) continue;
-                    if (reader.FieldCount < 125) continue; // Защита по ширине таблицы Заказа
-
-                    // 1. Артикул: Столбцы 70-77 (Индекс в C# строго 69)
-                    object artObj = reader.GetValue(69);
-
-                    // ЖЕСТКОЕ ОГРАНИЧЕНИЕ ЗАКАЗА: Если ячейка артикула пуста - прекращаем чтение файла
-                    if (artObj == null || string.IsNullOrEmpty(artObj.ToString().Trim()))
+                    int currentRow = 0;
+                    while (reader.Read())
                     {
-                        break; // Выходим из цикла чтения Заказа, так как позиции закончились
-                    }
+                        currentRow++;
+                        if (currentRow < startRow) continue;
 
-                    string article = artObj.ToString().Trim();
-                    if (article == "Артикул") continue; // Пропуск повторного заголовка
+                        object artObj = reader.GetValue(artIdx);
+                        if (artObj == null) continue;
 
-                    // 2. Наименование заказчика (Столбцы 27-59, индекс в C# строго 26)
-                    object custNameObj = reader.GetValue(26);
-                    string customerName = custNameObj != null ? custNameObj.ToString().Trim() : "";
+                        string art = artObj.ToString().Trim();
 
-                    // 3. Количество: Левая половинка блока (Столбцы 102-105, индекс в C# строго 101)
-                    object qtyObj = reader.GetValue(101);
-                    int qty = 0;
-                    if (qtyObj != null) int.TryParse(qtyObj.ToString(), out qty);
+                        // Маркер окончания данных в заказе
+                        if (art.ToUpper().Contains("ИТОГО") || art.ToUpper().Contains("ВСЕГО"))
+                            break;
 
-                    // 4. Цена закупки без НДС: Столбцы 120-124 (индекс в C# строго 119)
-                    object priceObj = reader.GetValue(119);
-                    decimal price = 0;
-                    if (priceObj != null) decimal.TryParse(priceObj.ToString(), out price);
+                        string name = reader.GetValue(nameIdx)?.ToString() ?? "";
 
-                    if (qty > 0)
-                    {
-                        list.Add(new OrderProduct
+                        int qty = 0;
+                        object qtyObj = reader.GetValue(qtyIdx);
+                        if (qtyObj != null) int.TryParse(qtyObj.ToString(), out qty);
+
+                        decimal price = 0;
+                        object priceObj = reader.GetValue(priceIdx);
+                        if (priceObj != null) decimal.TryParse(priceObj.ToString(), out price);
+
+                        if (qty > 0)
                         {
-                            Article = article,
-                            CustomerName = customerName,
-                            Quantity = qty,
-                            TotalSumWithoutNds = qty * price // Вычисляем стоимость всей строки без НДС
-                        });
+                            result.Add(new ProductItem
+                            {
+                                Article = art,
+                                FullName = name,
+                                Quantity = qty,
+                                Price = price,
+                                OrderRow = currentRow.ToString()
+                            });
+                        }
                     }
                 }
-                // =============================================================================
-                // КОНЕЦ // ЦИКЛ 4
-                // =============================================================================
             }
-            return list;
+            return result;
         }
-    } // Конец класса Program
-} // Конец namespace TableComparer
+    }
+}
+
+//конец часть 3
