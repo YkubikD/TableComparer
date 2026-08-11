@@ -178,12 +178,15 @@ namespace TableComparer
 
 
         // Основной метод сверки
+        // =================================================================================
+        // НАСТОЯЩИЙ ОБНОВЛЕННЫЙ МЕТОД СВЕРКИ (С возвратом вашей облачной логики)
+        // =================================================================================
         static List<string> ExecuteComparison(List<ProductItem> ttnList, List<ProductItem> orderList)
         {
             List<string> report = new List<string>();
             bool hasDiscrepancies = false;
 
-            // Проходим по каждой позиции Заказа от "21 века"
+            // Проходим строго по каждой позиции Заказа от "21 века"
             foreach (var orderItem in orderList)
             {
                 // Очищаем артикул из заказа для поиска в облачном словаре
@@ -193,61 +196,54 @@ namespace TableComparer
                 if (!GoogleCloudDictionary.ContainsKey(cleanOrderArt))
                 {
                     hasDiscrepancies = true;
-                    report.Add($"[!] ПРЕДУПРЕЖДЕНИЕ: Артикул [{orderItem.Article}] ({orderItem.FullName}) ОТСУТСТВУЕТ в Гугл-таблице! Внесите его в базу.");
+                    report.Add($"[-] Товар из Заказа [{orderItem.Article}] ({orderItem.FullName}) ОТСУТСТВУЕТ в Гугл-таблице! Внесите его в базу.");
                     continue;
                 }
 
-                // Достаем из облачной базы полное текстовое наименование
+                // Достаем из облачной базы точное текстовое наименование для поиска в ТТН
                 string cloudTtnNameTarget = GoogleCloudDictionary[cleanOrderArt].ToUpper().Replace(" ", "").Replace("-", "");
 
-                // Выделяем базовое имя модели для сопоставления (например, ARGO420, BLADE500, S416)
-                string modelKey = "";
-                if (cloudTtnNameTarget.Contains("ARGO")) modelKey = "ARGO";
-                else if (cloudTtnNameTarget.Contains("BLADE")) modelKey = "BLADE";
-                else if (cloudTtnNameTarget.Contains("TOLERO")) modelKey = "TOLERO";
-                else if (cloudTtnNameTarget.Contains("BRIG")) modelKey = "BRIG";
-                else if (cloudTtnNameTarget.Contains("GALS")) modelKey = "GALS";
-                else if (cloudTtnNameTarget.Contains("SMART")) modelKey = "SMART";
-                else if (cloudTtnNameTarget.Contains("URBAN")) modelKey = "URBAN";
-                else if (cloudTtnNameTarget.Contains("CORNER")) modelKey = "CORNER";
-                else if (cloudTtnNameTarget.Contains("RONDO")) modelKey = "RONDO";
-                else if (cloudTtnNameTarget.Contains("UNIQUE")) modelKey = "UNIQUE";
-                else if (cloudTtnNameTarget.Contains("QUADRO")) modelKey = "QUADRO";
+                // Определяем сторону чаши для Заказа (из названия или артикула)
+                string orderSide = "БЕЗ_МАРКИРОВКИ";
+                if (cleanOrderArt.EndsWith("L") || orderItem.FullName.ToUpper().Contains("ЛЕВ") || orderItem.FullName.ToUpper().Contains("СЛЕВА") || orderItem.FullName.ToUpper().Contains("ЧАШАЛЕВАЯ")) orderSide = "ЛЕВАЯ";
+                if (cleanOrderArt.EndsWith("R") || orderItem.FullName.ToUpper().Contains("ПРАВ") || orderItem.FullName.ToUpper().Contains("СПРАВА") || orderItem.FullName.ToUpper().Contains("ЧАШАПРАВАЯ")) orderSide = "ПРАВАЯ";
 
-                // Если в облачном наименовании есть специфичный цифровой индекс модели (например, 420, 460, 445)
-                string digits = new string(cloudTtnNameTarget.Where(char.IsDigit).ToArray());
+                // Ищем совпадение в ТТН строго по тексту из вашей Гугл-базы И с контролем стороны чаши!
+                ProductItem ttnMatch = ttnList.Find(t => {
+                    if (t.IsMatched) return false;
 
-                // Ищем подходящий товар в ТТН отгрузки склада среди еще не сопоставленных
-                var matchedTtn = ttnList.Find(t => !t.IsMatched && (
-                    // Вариант 1: Полное совпадение очищенного текста из облака с текстом ТТН
-                    t.FullName.ToUpper().Replace(" ", "").Replace("-", "").Contains(cloudTtnNameTarget) ||
-                    // Вариант 2: Защитный поиск по бренду, цифрам серии и стороне чаши
-                    (!string.IsNullOrEmpty(modelKey) &&
-                     t.FullName.ToUpper().Replace(" ", "").Replace("-", "").Contains(modelKey) &&
-                     (!string.IsNullOrEmpty(digits) && t.FullName.Contains(digits)) &&
-                     MatchSides(t.FullName, orderItem.FullName))
-                ));
+                    string cleanTtnName = t.FullName.ToUpper().Replace(" ", "").Replace("-", "");
 
-                if (matchedTtn != null)
+                    // 1. Проверяем, содержит ли строка ТТН текст-ориентир из вашей Гугл-базы
+                    if (!cleanTtnName.Contains(cloudTtnNameTarget)) return false;
+
+                    // 2. Если имя из базы содержит конкретную чашу, то жесткая проверка на сторону не нужна (уже совпало)
+                    if (cloudTtnNameTarget.Contains("ЛЕВ") || cloudTtnNameTarget.Contains("ПРАВ")) return true;
+
+                    // 3. Если в базе имя общее, проверяем сторону чаши физически в строке ТТН
+                    string ttnSide = "БЕЗ_МАРКИРОВКИ";
+                    if (cleanTtnName.Contains("ЛЕВ") || cleanTtnName.Contains("СЛЕВА")) ttnSide = "ЛЕВАЯ";
+                    if (cleanTtnName.Contains("ПРАВ") || cleanTtnName.Contains("СПРАВА")) ttnSide = "ПРАВАЯ";
+
+                    return orderSide == ttnSide;
+                });
+
+                if (ttnMatch != null)
                 {
-                    matchedTtn.IsMatched = true;
-                    orderItem.IsMatched = true;
+                    orderItem.IsMatched = true; ttnMatch.IsMatched = true;
+                    bool qtyMismatch = orderItem.Quantity != ttnMatch.Quantity;
+                    bool sumMismatch = Math.Round(orderItem.TotalSum, 2) != Math.Round(ttnMatch.TotalSum, 2);
 
-                    // Проверяем расхождения по количеству или по цене отгрузки
-                    if (matchedTtn.Quantity != orderItem.Quantity || Math.Abs(matchedTtn.Price - orderItem.Price) > 0.05m)
+                    if (qtyMismatch || sumMismatch)
                     {
                         hasDiscrepancies = true;
-                        string diff = $"[!] Расхождение по товару (Код 1С: {orderItem.Article}):\n" +
-                                      $"    Заказ (21 век): {orderItem.FullName}\n" +
-                                      $"    ТТН (Отгрузка): {matchedTtn.FullName}\n";
+                        string err = $"[!] Расхождение по товару (Код 1С: {orderItem.Article}):\n" +
+                                     $"    Заказ (21 век): {orderItem.FullName}\n" +
+                                     $"    ТТН (Отгрузка): {ttnMatch.FullName}\n";
+                        if (qtyMismatch) err += $"    [-] КОЛИЧЕСТВО: Заказ = {orderItem.Quantity} шт. | ТТН = {ttnMatch.Quantity} шт. (Разница: {orderItem.Quantity - ttnMatch.Quantity})\n";
+                        if (sumMismatch) err += $"    [-] СУММА БЕЗ НДС: Заказ = {orderItem.TotalSum:F2} руб. | ТТН = {ttnMatch.TotalSum:F2} руб.\n";
 
-                        if (matchedTtn.Quantity != orderItem.Quantity)
-                            diff += $"    [-] КОЛИЧЕСТВО: Заказ = {orderItem.Quantity} шт. | ТТН = {matchedTtn.Quantity} шт. (Разница: {orderItem.Quantity - matchedTtn.Quantity})\n";
-
-                        if (Math.Abs(matchedTtn.Price - orderItem.Price) > 0.05m)
-                            diff += $"    [-] ЦЕНА: Заказ = {orderItem.Price} руб. | ТТН = {matchedTtn.Price} руб.\n";
-
-                        report.Add(diff);
+                        report.Add(err);
                     }
                 }
                 else
@@ -257,27 +253,17 @@ namespace TableComparer
                 }
             }
 
-            // Ищем позиции, которые склад отгрузил по ТТН, но "21 век" их не заказывал
-            foreach (var ttnItem in ttnList.Where(t => !t.IsMatched))
+            // // ЦИКЛ 2: Проверка лишних позиций в ТТН
+            foreach (var ttn in ttnList)
             {
-                hasDiscrepancies = true;
-                report.Add($"[+] Лишний товар в ТТН! Позиция [{ttnItem.FullName}] отсутствует в Заказе клиента.");
+                if (!ttn.IsMatched)
+                {
+                    hasDiscrepancies = true;
+                    report.Add($"[+] Лишний товар в ТТН! Позиция [{ttn.FullName}] отсутствует в Заказе клиента.");
+                }
             }
 
-            if (!hasDiscrepancies) report.Add("[OK] Склад полностью и правильно отгрузил Заказ. Позиции, количества и цены совпали идеально.");
             return report;
-        }
-
-        // Вспомогательный метод проверки направления чаши (ЛЕВ/ПРАВ/L/R)
-        static bool MatchSides(string ttnName, string orderName)
-        {
-            string t = ttnName.ToUpper();
-            string o = orderName.ToUpper();
-
-            bool ttnSide = t.Contains("ЛЕВ") || t.Contains("L") || t.Contains("СЛЕВА") || t.Contains("ЛЕВАЯ");
-            bool ordSide = o.Contains("ЛЕВ") || o.Contains("L") || o.Contains("СЛЕВА") || o.Contains("ЛЕВАЯ");
-
-            return ttnSide == ordSide;
         }
 
 
