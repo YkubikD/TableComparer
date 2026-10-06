@@ -65,7 +65,19 @@ namespace TableComparer
             Console.WriteLine($"Успешно: ТТН = {ttnList.Count} поз. | Заказ = {orderList.Count} поз.");
             Console.ResetColor();
 
-            Console.WriteLine("[3/3] Выполнение автоматической сверки...");
+            // === ДИАГНОСТИКА ===
+            Console.ForegroundColor = ConsoleColor.DarkCyan;
+            Console.WriteLine("\n--- ТТН (первые 5 позиций) ---");
+            foreach (var t in ttnList.Take(5))
+                Console.WriteLine($"  стр.{t.TtnRow}: qty={t.Quantity} price={t.Price} | {t.FullName}");
+
+            Console.WriteLine("\n--- Заказ (первые 5 позиций) ---");
+            foreach (var o in orderList.Take(5))
+                Console.WriteLine($"  стр.{o.OrderRow}: art={o.Article} qty={o.Quantity} price={o.Price} | {o.FullName}");
+            Console.ResetColor();
+            // === /ДИАГНОСТИКА ===
+
+            Console.WriteLine("\n[3/3] Выполнение автоматической сверки...");
             List<string> reportLines = ExecuteComparison(ttnList, orderList);
 
             Console.WriteLine("\n=== РЕЗУЛЬТАТЫ СВЕРКИ ===");
@@ -75,6 +87,7 @@ namespace TableComparer
                 else if (line.StartsWith("[-]")) Console.ForegroundColor = ConsoleColor.Red;
                 else if (line.StartsWith("[!]")) Console.ForegroundColor = ConsoleColor.Yellow;
                 else if (line.StartsWith("[+]")) Console.ForegroundColor = ConsoleColor.Magenta;
+                else if (line.StartsWith("===")) Console.ForegroundColor = ConsoleColor.Cyan;
 
                 Console.WriteLine(line);
                 Console.ResetColor();
@@ -86,49 +99,73 @@ namespace TableComparer
             Console.ReadLine();
         }
 
+        // =================================================================================
+        // ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ДЛЯ НАДЁЖНОГО ПАРСИНГА ЧИСЕЛ ИЗ EXCEL
+        // =================================================================================
+        static int ReadInt(object obj)
+        {
+            if (obj == null) return 0;
+            if (obj is double d) return (int)Math.Round(d);
+            if (obj is decimal m) return (int)Math.Round(m);
+            if (obj is int i) return i;
+            if (obj is long l) return (int)l;
+            int.TryParse(obj.ToString(), out int v);
+            return v;
+        }
+
+        static decimal ReadDecimal(object obj)
+        {
+            if (obj == null) return 0m;
+            if (obj is double d) return (decimal)d;
+            if (obj is decimal m) return m;
+            if (obj is int i) return i;
+            if (obj is long l) return l;
+            var s = obj.ToString().Replace(',', '.');
+            decimal.TryParse(s, System.Globalization.NumberStyles.Any,
+                             System.Globalization.CultureInfo.InvariantCulture, out var v);
+            return v;
+        }
+
+        // =================================================================================
+        // ЗАГРУЗКА ОБЛАЧНОЙ БАЗЫ
+        // =================================================================================
         static bool LoadGoogleSpreadsheet(string url)
         {
             try
             {
                 using (HttpClient client = new HttpClient())
                 {
-                    // Скачиваем CSV поток данных
                     var stream = client.GetStreamAsync(url).Result;
 
-                    // Используем встроенный неубиваемый TextFieldParser для разбора CSV с кавычками
                     using (var parser = new Microsoft.VisualBasic.FileIO.TextFieldParser(stream, Encoding.UTF8))
                     {
                         parser.TextFieldType = Microsoft.VisualBasic.FileIO.FieldType.Delimited;
                         parser.SetDelimiters(",");
-                        parser.HasFieldsEnclosedInQuotes = true; // Защита от запятых внутри названий моек
+                        parser.HasFieldsEnclosedInQuotes = true;
 
                         bool isHeader = true;
 
                         while (!parser.EndOfData)
                         {
                             string[] parts = parser.ReadFields();
-                            if (isHeader) { isHeader = false; continue; } // Пропускаем шапку
+                            if (isHeader) { isHeader = false; continue; }
 
                             if (parts == null || parts.Length < 2) continue;
 
-                            string fullName = parts[0]?.Trim() ?? ""; // Колонка A
-                            string article = parts[1]?.Trim() ?? "";  // Колонка B
+                            string fullName = parts[0]?.Trim() ?? "";
+                            string article = parts[1]?.Trim() ?? "";
 
-                            // СТОП-МАРКЕР: Если артикул пустой — таблица гарантированно закончилась
                             if (string.IsNullOrEmpty(article) || article.ToLower().Contains("штамп"))
                                 break;
 
-                            // Если артикул есть, но имя пустое — подставляем артикул, чтобы не упасть
                             if (string.IsNullOrEmpty(fullName))
                             {
                                 fullName = "Модель без имени (" + article + ")";
                             }
 
-                            // Пропускаем служебные заголовки
                             if (article.ToLower().Contains("артикул"))
                                 continue;
 
-                            // Создаем чистый ключ без пробелов и дефисов
                             string cleanArtKey = article.Replace(" ", "").Replace("-", "").ToUpper();
 
                             if (!GoogleCloudDictionary.ContainsKey(cleanArtKey))
@@ -169,58 +206,38 @@ namespace TableComparer
             return null;
         }
 
-
-
-
-        //конец части 1
-
-
-
-
-        // Основной метод сверки
         // =================================================================================
-        // НАСТОЯЩИЙ ОБНОВЛЕННЫЙ МЕТОД СВЕРКИ (С возвратом вашей облачной логики)
+        // МЕТОД СВЕРКИ (с проверкой КОЛИЧЕСТВА, ЦЕНЫ, СУММЫ + вывод [OK] + СВОДКА)
         // =================================================================================
         static List<string> ExecuteComparison(List<ProductItem> ttnList, List<ProductItem> orderList)
         {
             List<string> report = new List<string>();
-            bool hasDiscrepancies = false;
 
-            // Проходим строго по каждой позиции Заказа от "21 века"
             foreach (var orderItem in orderList)
             {
-                // Очищаем артикул из заказа для поиска в облачном словаре
                 string cleanOrderArt = orderItem.Article.Replace(" ", "").Replace("-", "").ToUpper();
 
-                // Проверяем, внесли ли вы этот артикул в Гугл-таблицу (Лист 4)
                 if (!GoogleCloudDictionary.ContainsKey(cleanOrderArt))
                 {
-                    hasDiscrepancies = true;
                     report.Add($"[-] Товар из Заказа [{orderItem.Article}] ({orderItem.FullName}) ОТСУТСТВУЕТ в Гугл-таблице! Внесите его в базу.");
                     continue;
                 }
 
-                // Достаем из облачной базы точное текстовое наименование для поиска в ТТН
                 string cloudTtnNameTarget = GoogleCloudDictionary[cleanOrderArt].ToUpper().Replace(" ", "").Replace("-", "");
 
-                // Определяем сторону чаши для Заказа (из названия или артикула)
                 string orderSide = "БЕЗ_МАРКИРОВКИ";
                 if (cleanOrderArt.EndsWith("L") || orderItem.FullName.ToUpper().Contains("ЛЕВ") || orderItem.FullName.ToUpper().Contains("СЛЕВА") || orderItem.FullName.ToUpper().Contains("ЧАШАЛЕВАЯ")) orderSide = "ЛЕВАЯ";
                 if (cleanOrderArt.EndsWith("R") || orderItem.FullName.ToUpper().Contains("ПРАВ") || orderItem.FullName.ToUpper().Contains("СПРАВА") || orderItem.FullName.ToUpper().Contains("ЧАШАПРАВАЯ")) orderSide = "ПРАВАЯ";
 
-                // Ищем совпадение в ТТН строго по тексту из вашей Гугл-базы И с контролем стороны чаши!
                 ProductItem ttnMatch = ttnList.Find(t => {
                     if (t.IsMatched) return false;
 
                     string cleanTtnName = t.FullName.ToUpper().Replace(" ", "").Replace("-", "");
 
-                    // 1. Проверяем, содержит ли строка ТТН текст-ориентир из вашей Гугл-базы
                     if (!cleanTtnName.Contains(cloudTtnNameTarget)) return false;
 
-                    // 2. Если имя из базы содержит конкретную чашу, то жесткая проверка на сторону не нужна (уже совпало)
                     if (cloudTtnNameTarget.Contains("ЛЕВ") || cloudTtnNameTarget.Contains("ПРАВ")) return true;
 
-                    // 3. Если в базе имя общее, проверяем сторону чаши физически в строке ТТН
                     string ttnSide = "БЕЗ_МАРКИРОВКИ";
                     if (cleanTtnName.Contains("ЛЕВ") || cleanTtnName.Contains("СЛЕВА")) ttnSide = "ЛЕВАЯ";
                     if (cleanTtnName.Contains("ПРАВ") || cleanTtnName.Contains("СПРАВА")) ttnSide = "ПРАВАЯ";
@@ -231,51 +248,92 @@ namespace TableComparer
                 if (ttnMatch != null)
                 {
                     orderItem.IsMatched = true; ttnMatch.IsMatched = true;
+
                     bool qtyMismatch = orderItem.Quantity != ttnMatch.Quantity;
+                    bool priceMismatch = Math.Round(orderItem.Price, 2) != Math.Round(ttnMatch.Price, 2);
                     bool sumMismatch = Math.Round(orderItem.TotalSum, 2) != Math.Round(ttnMatch.TotalSum, 2);
 
-                    if (qtyMismatch || sumMismatch)
+                    if (qtyMismatch || priceMismatch || sumMismatch)
                     {
-                        hasDiscrepancies = true;
-                        string err = $"[!] Расхождение по товару (Код 1С: {orderItem.Article}):\n" +
-                                     $"    Заказ (21 век): {orderItem.FullName}\n" +
-                                     $"    ТТН (Отгрузка): {ttnMatch.FullName}\n";
-                        if (qtyMismatch) err += $"    [-] КОЛИЧЕСТВО: Заказ = {orderItem.Quantity} шт. | ТТН = {ttnMatch.Quantity} шт. (Разница: {orderItem.Quantity - ttnMatch.Quantity})\n";
-                        if (sumMismatch) err += $"    [-] СУММА БЕЗ НДС: Заказ = {orderItem.TotalSum:F2} руб. | ТТН = {ttnMatch.TotalSum:F2} руб.\n";
+                        string err = $"[!] Расхождение (Код 1С: {orderItem.Article}):\n" +
+                                     $"    Заказ: {orderItem.FullName}\n" +
+                                     $"    ТТН:   {ttnMatch.FullName}\n";
+
+                        if (qtyMismatch)
+                            err += $"    [-] КОЛИЧЕСТВО: Заказ = {orderItem.Quantity} | ТТН = {ttnMatch.Quantity}\n";
+
+                        if (priceMismatch)
+                            err += $"    [-] ЦЕНА ЗА ШТ: Заказ = {orderItem.Price:F2} | ТТН = {ttnMatch.Price:F2} " +
+                                   $"(разница {orderItem.Price - ttnMatch.Price:F2})\n";
+
+                        if (sumMismatch)
+                            err += $"    [-] СУММА: Заказ = {orderItem.TotalSum:F2} | ТТН = {ttnMatch.TotalSum:F2}\n";
 
                         report.Add(err);
+                    }
+                    else
+                    {
+                        // ВСЁ СОШЛОСЬ
+                        report.Add($"[OK] {orderItem.Article} | {orderItem.FullName} | " +
+                                   $"кол-во = {orderItem.Quantity} | цена = {orderItem.Price:F2} | сумма = {orderItem.TotalSum:F2}");
                     }
                 }
                 else
                 {
-                    hasDiscrepancies = true;
-                    report.Add($"[-] Товар из Заказа [{orderItem.Article}] ({orderItem.FullName}) НЕ НАЙДЕН в ТТН отгрузки!");
+                    report.Add($"[-] Товар из Заказа [{orderItem.Article}] ({orderItem.FullName}) НЕ НАЙДЕН в ТТН отгрузки! " +
+                               $"Не хватает: {orderItem.Quantity} шт. | цена = {orderItem.Price:F2} | сумма = {orderItem.TotalSum:F2}");
                 }
             }
 
-            // // ЦИКЛ 2: Проверка лишних позиций в ТТН
+            // Лишние позиции в ТТН
             foreach (var ttn in ttnList)
             {
                 if (!ttn.IsMatched)
                 {
-                    hasDiscrepancies = true;
                     report.Add($"[+] Лишний товар в ТТН! Позиция [{ttn.FullName}] отсутствует в Заказе клиента.");
                 }
             }
 
+            // === СВОДКА ===
+            int okCount = report.Count(r => r.StartsWith("[OK]"));
+            int mismatchCount = report.Count(r => r.StartsWith("[!]"));
+            int notFoundCount = report.Count(r => r.StartsWith("[-] Товар из Заказа"));
+            int noCloudCount = report.Count(r => r.StartsWith("[-]") && r.Contains("ОТСУТСТВУЕТ в Гугл-таблице"));
+            int extraCount = report.Count(r => r.StartsWith("[+]"));
+
+            report.Add("");
+            report.Add("=== СВОДКА ===");
+            report.Add($"Позиций в Заказе:                     {orderList.Count}");
+            report.Add($"Позиций в ТТН:                        {ttnList.Count}");
+            report.Add($"Совпало полностью:                    {okCount}");
+            report.Add($"Расхождений (кол-во / цена / сумма):  {mismatchCount}");
+            report.Add($"Не найдено в ТТН:                     {notFoundCount}");
+            report.Add($"Нет в облачной базе:                  {noCloudCount}");
+            report.Add($"Лишних позиций в ТТН:                 {extraCount}");
+
+
+            int totalMissingQty = orderList
+    .Where(o => !o.IsMatched)
+    .Sum(o => o.Quantity);
+
+            decimal totalMissingSum = orderList
+                .Where(o => !o.IsMatched)
+                .Sum(o => o.TotalSum);
+
+            report.Add("");
+            report.Add($"ИТОГО не хватает:                    {totalMissingQty} шт. на сумму {totalMissingSum:F2} руб.");
+
+            if (mismatchCount == 0 && notFoundCount == 0 && noCloudCount == 0 && extraCount == 0)
+                report.Add("\n*** ВСЁ СОШЛОСЬ! ***");
+            else
+                report.Add("\n*** ЕСТЬ РАСХОЖДЕНИЯ, см. выше ***");
+
             return report;
         }
 
-
-
-
-
-        //конец части 2
-
-
-
-
-        // Метод для чтения Накладной (ТТН)
+        // =================================================================================
+        // ЧТЕНИЕ ТТН
+        // =================================================================================
         static List<ProductItem> ReadTtnDocument(string filePath, int startRow, int nameIdx, int qtyIdx, int priceIdx)
         {
             var result = new List<ProductItem>();
@@ -294,17 +352,11 @@ namespace TableComparer
 
                         string rawName = nameObj.ToString();
 
-                        // Прерываем чтение при обнаружении итоговых строк
                         if (rawName.ToUpper().Contains("ВСЕГО") || rawName.ToUpper().Contains("ИТОГО"))
                             break;
 
-                        int qty = 0;
-                        object qtyObj = reader.GetValue(qtyIdx);
-                        if (qtyObj != null) int.TryParse(qtyObj.ToString(), out qty);
-
-                        decimal price = 0;
-                        object priceObj = reader.GetValue(priceIdx);
-                        if (priceObj != null) decimal.TryParse(priceObj.ToString(), out price);
+                        int qty = ReadInt(reader.GetValue(qtyIdx));
+                        decimal price = ReadDecimal(reader.GetValue(priceIdx));
 
                         if (qty > 0)
                         {
@@ -313,6 +365,7 @@ namespace TableComparer
                                 FullName = rawName,
                                 Quantity = qty,
                                 Price = price,
+                                TotalSum = qty * price,
                                 TtnRow = currentRow.ToString()
                             });
                         }
@@ -322,7 +375,9 @@ namespace TableComparer
             return result;
         }
 
-        // Метод для чтения файла Заказа
+        // =================================================================================
+        // ЧТЕНИЕ ЗАКАЗА
+        // =================================================================================
         static List<ProductItem> ReadOrderDocument(string filePath, int startRow, int artIdx, int nameIdx, int qtyIdx, int priceIdx)
         {
             var result = new List<ProductItem>();
@@ -341,19 +396,13 @@ namespace TableComparer
 
                         string art = artObj.ToString().Trim();
 
-                        // Маркер окончания данных в заказе
                         if (art.ToUpper().Contains("ИТОГО") || art.ToUpper().Contains("ВСЕГО"))
                             break;
 
                         string name = reader.GetValue(nameIdx)?.ToString() ?? "";
 
-                        int qty = 0;
-                        object qtyObj = reader.GetValue(qtyIdx);
-                        if (qtyObj != null) int.TryParse(qtyObj.ToString(), out qty);
-
-                        decimal price = 0;
-                        object priceObj = reader.GetValue(priceIdx);
-                        if (priceObj != null) decimal.TryParse(priceObj.ToString(), out price);
+                        int qty = ReadInt(reader.GetValue(qtyIdx));
+                        decimal price = ReadDecimal(reader.GetValue(priceIdx));
 
                         if (qty > 0)
                         {
@@ -363,6 +412,7 @@ namespace TableComparer
                                 FullName = name,
                                 Quantity = qty,
                                 Price = price,
+                                TotalSum = qty * price,
                                 OrderRow = currentRow.ToString()
                             });
                         }
@@ -373,5 +423,3 @@ namespace TableComparer
         }
     }
 }
-
-//конец часть 3
